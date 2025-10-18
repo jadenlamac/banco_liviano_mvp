@@ -21,8 +21,10 @@ if db_url.startswith("postgres://"):
     db_url = db_url.replace("postgres://", "postgresql://", 1)
 
 # ✅ Asegura que use SSL (requerido por Supabase)
-if "?sslmode=require" not in db_url:
-    db_url += "?sslmode=require"
+# MODIFICACIÓN: Se comentan estas líneas. Si usas el Pooler de Supabase (puerto 6543),
+# este ya maneja el SSL y añadir el parámetro aquí puede causar el error.
+# if "?sslmode=require" not in db_url:
+#     db_url += "?sslmode=require"
 
 # ✅ Log de conexión
 print("🧩 Conectando a base de datos:", db_url)
