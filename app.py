@@ -11,27 +11,24 @@ app = Flask(__name__)
 CORS(app)
 
 # =================================================================
-#                      ⚙️ CONFIGURACIÓN DB (SUPABASE)
+# ⚙️ CONFIGURACIÓN DE LA BASE DE DATOS (SUPABASE)
 # =================================================================
 
-# ✅ Conecta directamente a tu base "banco_liviano_db"
-db_url = os.getenv(
-    "SUPABASE_DB_URL",
-    "postgresql://postgres:punky_aki14@db.dqoohfqkzcvoxjkijfpd.supabase.co:5432/banco_liviano_db"
-)
+# Lee la URL desde la variable de entorno (Render la proveerá)
+db_url = os.getenv("SUPABASE_DB_URL", "sqlite:///banco_liviano.db")
 
-# Corrige formato si viene como postgres://
+# Si viene en formato postgres:// lo corregimos
 if db_url.startswith("postgres://"):
     db_url = db_url.replace("postgres://", "postgresql://", 1)
 
-# Conexión con SSL requerida por Supabase
+# Forzamos el uso de SSL para conectar con Supabase
 app.config["SQLALCHEMY_DATABASE_URI"] = db_url + "?sslmode=require"
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
 db = SQLAlchemy(app)
 
 # =================================================================
-#                      🧱 MODELOS DE BASE DE DATOS
+# 🧱 MODELOS DE BASE DE DATOS
 # =================================================================
 
 class Usuario(db.Model):
@@ -55,7 +52,7 @@ class Movimiento(db.Model):
     fecha = db.Column(db.DateTime, default=datetime.utcnow)
 
 # =================================================================
-#                      🌐 RUTAS DEL API
+# 🌐 RUTAS DEL API
 # =================================================================
 
 @app.route("/")
@@ -203,7 +200,7 @@ def pagar():
     })
 
 # =================================================================
-#                      🚀 ARRANQUE DEL SERVIDOR
+# 🚀 ARRANQUE DEL SERVIDOR
 # =================================================================
 
 with app.app_context():
