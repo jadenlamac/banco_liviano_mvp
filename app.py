@@ -6,8 +6,9 @@ from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
-from datetime import datetime
+from datetime import datetime, timedelta
 from sqlalchemy import Numeric
+from decimal import Decimal
 import os
 import uuid
 import base64
@@ -32,18 +33,51 @@ db = SQLAlchemy(app)
 
 # --------------------------------------------------------------
 # 🔑 CREDENCIALES PAYPHONE PRODUCCIÓN
-#    (ponlas como variables en Render para mayor seguridad)
 # --------------------------------------------------------------
 PAYPHONE_CLIENT_ID = os.getenv("PAYPHONE_CLIENT_ID", "J8GXWq6hPUdK0jSb93BQ")
 PAYPHONE_SECRET    = os.getenv("PAYPHONE_SECRET",    "cHD4J4oikm6zqxs5OyA")
 PAYPHONE_STORE_ID  = int(os.getenv("PAYPHONE_STORE_ID", "125555"))
 
-# Endpoint oficial de producción
-PAYPHONE_URL_API      = "https://pay.payphonetodoesposible.com/api/Sale"
+# Endpoints de producción
+PAYPHONE_URL_AUTH     = "https://pay.payphonetodoesposible.com/api/Authentication"
+PAYPHONE_URL_SALE     = "https://pay.payphonetodoesposible.com/api/Sale"
 PAYPHONE_URL_CALLBACK = os.getenv(
     "PAYPHONE_CALLBACK_URL",
     "https://banco-liviano-mvp.onrender.com/payphone_callback"
 )
+
+# Cache simple del token (memoria del proceso)
+_TOKEN_CACHE = {"token": None, "exp": datetime.utcnow()}
+
+def _get_payphone_token():
+    """
+    Obtiene y cachea el access token de PayPhone.
+    - Se autentica con BASIC (client_id:secret) contra /api/Authentication
+    - Devuelve el token (string) para usar como Bearer en /api/Sale
+    """
+    global _TOKEN_CACHE
+
+    # Si el token existe y no ha expirado, úsalo
+    if _TOKEN_CACHE["token"] and datetime.utcnow() < _TOKEN_CACHE["exp"]:
+        return _TOKEN_CACHE["token"]
+
+    basic = base64.b64encode(f"{PAYPHONE_CLIENT_ID}:{PAYPHONE_SECRET}".encode()).decode()
+    headers = {"Authorization": f"Basic {basic}"}
+    try:
+        r = requests.post(PAYPHONE_URL_AUTH, headers=headers, timeout=20)
+        # La API devuelve el token como string JSON (ej: "xxxxx")
+        if r.status_code == 200:
+            token = r.text.strip().strip('"')
+            # Cache por ~55 minutos (el token suele durar 1h)
+            _TOKEN_CACHE = {"token": token, "exp": datetime.utcnow() + timedelta(minutes=55)}
+            print("✅ TOKEN PayPhone obtenido.")
+            return token
+        else:
+            print("❌ Error AUTH PayPhone:", r.status_code, r.text)
+            return None
+    except Exception as e:
+        print("❌ Excepción AUTH PayPhone:", e)
+        return None
 
 # --------------------------------------------------------------
 # 🧱 MODELOS DE BASE DE DATOS
@@ -54,7 +88,7 @@ class Usuario(db.Model):
     cedula = db.Column(db.String(10), unique=True, nullable=False)
     telefono = db.Column(db.String(15), unique=True, nullable=False)
     password_hash = db.Column(db.String(200), nullable=False)
-    saldo = db.Column(Numeric(10, 2), default=0.00)
+    saldo = db.Column(Numeric(10, 2), default=Decimal("0.00"))
     qr_key_id = db.Column(db.String(36), unique=True, nullable=False)
     movimientos = db.relationship("Movimiento", backref="usuario", lazy=True)
 
@@ -173,18 +207,20 @@ def movimientos(cedula):
 
 # --------------------------------------------------------------
 # 💳 INICIAR PAGO PAYPHONE (PRODUCCIÓN)
-#   - Crea un movimiento PENDIENTE (no suma saldo aún)
-#   - Llama a PayPhone con autenticación BASIC
+#   - Crea un movimiento PENDIENTE
+#   - Pide token a /api/Authentication (Basic)
+#   - Llama a /api/Sale con Authorization: Bearer <token>
 #   - Devuelve URL de checkout
 # --------------------------------------------------------------
 @app.route("/iniciar_pago_payphone", methods=["POST"])
 def iniciar_pago_payphone():
     data = request.get_json()
     cedula = data.get("nombre")
+
     try:
-        monto = float(data.get("monto", 0))
+        monto = Decimal(str(data.get("monto", 0)))
     except Exception:
-        monto = 0
+        monto = Decimal("0")
 
     if monto <= 0:
         return jsonify({"error": "Monto inválido"}), 400
@@ -198,7 +234,7 @@ def iniciar_pago_payphone():
     if phone.startswith("0"):
         phone = phone[1:]
 
-    monto_centavos = int(round(monto * 100))
+    monto_centavos = int((monto * 100).quantize(Decimal("1")))
     reference = f"TX-{uuid.uuid4().hex[:10]}"
 
     # 1) Registrar movimiento PENDIENTE (no sumamos al saldo aún)
@@ -211,8 +247,14 @@ def iniciar_pago_payphone():
     db.session.add(mov)
     db.session.commit()
 
+    # 2) Obtener token
+    token = _get_payphone_token()
+    if not token:
+        return jsonify({"error": "No se pudo obtener el token de PayPhone"}), 500
+
+    # 3) Preparar payload
     payload = {
-        "phoneNumber": phone,
+        "phoneNumber": phone,          # para web checkout puedes enviarlo o dejar que el usuario ingrese
         "countryCode": "593",
         "clientUserId": usuario.cedula,
         "reference": reference,
@@ -225,25 +267,18 @@ def iniciar_pago_payphone():
         "callbackURL": PAYPHONE_URL_CALLBACK,
     }
 
-    # Autenticación BASIC: base64("CLIENT_ID:SECRET")
-    basic_token = base64.b64encode(f"{PAYPHONE_CLIENT_ID}:{PAYPHONE_SECRET}".encode()).decode()
     headers = {
-        "Authorization": f"Basic {basic_token}",
+        "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     }
 
     try:
-        r = requests.post(PAYPHONE_URL_API, json=payload, headers=headers, timeout=30)
-        print("📤 Enviado a PayPhone:", r.status_code, r.text)
+        r = requests.post(PAYPHONE_URL_SALE, json=payload, headers=headers, timeout=30)
+        print("📤 Enviado a PayPhone /Sale:", r.status_code, r.text)
         if r.status_code == 200:
             response = r.json()
-            # Respuesta correcta trae 'payWithPayPhoneUrl'
             if "payWithPayPhoneUrl" in response:
-                return jsonify({
-                    "ok": True,
-                    "payphone_url": response["payWithPayPhoneUrl"]
-                })
-            # Si no trae la URL, devolvemos detalle
+                return jsonify({"ok": True, "payphone_url": response["payWithPayPhoneUrl"]})
             return jsonify({"error": "Respuesta inesperada de PayPhone", "detalle": response}), 500
         else:
             return jsonify({"error": "Error en PayPhone", "detalle": r.text}), 500
@@ -252,15 +287,17 @@ def iniciar_pago_payphone():
 
 
 # --------------------------------------------------------------
-# 🔁 CALLBACK PAYPHONE (marca movimiento COMPLETADO y acredita saldo)
+# 🔁 CALLBACK PAYPHONE
+#   - Marca movimiento COMPLETADO y acredita saldo si fue aprobado
 # --------------------------------------------------------------
 @app.route("/payphone_callback", methods=["GET", "POST"])
 def payphone_callback():
     data = request.values.to_dict()
     print("📥 Callback recibido:", data)
 
-    reference = data.get("reference")
-    transaction_status = data.get("transactionStatus") or data.get("status")  # por si cambia el nombre
+    # PayPhone suele enviar 'reference'. Si no, intenta alternativas por si cambian nombres.
+    reference = data.get("reference") or data.get("clientTransactionId") or data.get("clientUserId")
+    transaction_status = data.get("transactionStatus") or data.get("status")
 
     if not reference:
         return "Sin referencia", 400
@@ -269,25 +306,22 @@ def payphone_callback():
     if not mov:
         return "Transacción no encontrada", 404
 
-    # Solo si estaba pendiente y el status es aprobado
     titulo_original = mov.titulo or ""
     aprobado = str(transaction_status).lower() in ("approved", "aprobada", "success", "ok", "true", "1", "aprobado")
 
     if titulo_original.startswith("[PENDIENTE]"):
         if aprobado:
-            # Acreditar saldo y marcar movimiento
             usuario = mov.usuario
-            usuario.saldo = (usuario.saldo or 0) + mov.monto
+            # Sumar con Decimal para evitar conflictos (Numeric devuelve Decimal)
+            usuario.saldo = (usuario.saldo or Decimal("0")) + (mov.monto or Decimal("0"))
             mov.titulo = titulo_original.replace("[PENDIENTE] ", "").strip()
             db.session.commit()
             return "<h3>✅ Recarga completada correctamente. Puedes cerrar esta ventana.</h3>"
         else:
-            # Marcar como fallida (opcional: podrías borrar o renombrar)
             mov.titulo = titulo_original.replace("[PENDIENTE]", "[FALLIDA]").strip()
             db.session.commit()
             return "<h3>❌ Pago rechazado o cancelado.</h3>"
 
-    # Si ya no estaba pendiente, simplemente confirmamos
     return "<h3>ℹ️ Recarga ya procesada.</h3>"
 
 
