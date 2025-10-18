@@ -11,16 +11,18 @@ app = Flask(__name__)
 CORS(app)
 
 # =================================================================
-#                      ⚙️ CONFIGURACIÓN DB (Render + Local)
+#                      ⚙️ CONFIGURACIÓN DB (SUPABASE)
 # =================================================================
 
-db_url = os.getenv("DATABASE_URL", "sqlite:///banco_liviano.db")
+# Lee tu URL de Supabase desde variable de entorno
+db_url = os.getenv("SUPABASE_DB_URL", "sqlite:///banco_liviano.db")
 
-# Render usa "postgres://" y SQLAlchemy necesita "postgresql://"
+# Corrige formato si viene como postgres://
 if db_url.startswith("postgres://"):
     db_url = db_url.replace("postgres://", "postgresql://", 1)
 
-app.config["SQLALCHEMY_DATABASE_URI"] = db_url
+# Conexión con SSL requerida para Supabase
+app.config["SQLALCHEMY_DATABASE_URI"] = db_url + "?sslmode=require"
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
 db = SQLAlchemy(app)
@@ -55,7 +57,7 @@ class Movimiento(db.Model):
 
 @app.route("/")
 def index():
-    return jsonify({"ok": True, "service": "Banco Liviano API conectada en Render"})
+    return jsonify({"ok": True, "service": "Banco Liviano API conectada a Supabase"})
 
 # -------------------- CREAR USUARIO --------------------
 @app.route("/crear_usuario", methods=["POST"])
