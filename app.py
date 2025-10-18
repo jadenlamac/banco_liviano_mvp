@@ -2,7 +2,7 @@
 # 🏦 BANCO LIVIANO API — PRODUCCIÓN (Supabase + PayPhone)
 # ==============================================================
 
-from flask import Flask, request, jsonify, redirect
+from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -10,6 +10,7 @@ from datetime import datetime
 from sqlalchemy import Numeric
 import os
 import uuid
+import base64
 import requests
 
 # --------------------------------------------------------------
@@ -31,14 +32,18 @@ db = SQLAlchemy(app)
 
 # --------------------------------------------------------------
 # 🔑 CREDENCIALES PAYPHONE PRODUCCIÓN
+#    (ponlas como variables en Render para mayor seguridad)
 # --------------------------------------------------------------
-PAYPHONE_TOKEN = "J8GXWq6hPUdK0jSb93BQ"
-PAYPHONE_SECRET = "cHD4J4oikm6zqxs5OyA"
-PAYPHONE_STORE_ID = 125555
+PAYPHONE_CLIENT_ID = os.getenv("PAYPHONE_CLIENT_ID", "J8GXWq6hPUdK0jSb93BQ")
+PAYPHONE_SECRET    = os.getenv("PAYPHONE_SECRET",    "cHD4J4oikm6zqxs5OyA")
+PAYPHONE_STORE_ID  = int(os.getenv("PAYPHONE_STORE_ID", "125555"))
 
 # Endpoint oficial de producción
-PAYPHONE_URL_API = "https://pay.payphonetodoesposible.com/api/Sale"
-PAYPHONE_URL_CALLBACK = "https://banco-liviano-mvp.onrender.com/payphone_callback"
+PAYPHONE_URL_API      = "https://pay.payphonetodoesposible.com/api/Sale"
+PAYPHONE_URL_CALLBACK = os.getenv(
+    "PAYPHONE_CALLBACK_URL",
+    "https://banco-liviano-mvp.onrender.com/payphone_callback"
+)
 
 # --------------------------------------------------------------
 # 🧱 MODELOS DE BASE DE DATOS
@@ -67,6 +72,10 @@ class Movimiento(db.Model):
 # --------------------------------------------------------------
 # 🌐 RUTAS PRINCIPALES
 # --------------------------------------------------------------
+@app.route("/health")
+def health():
+    return jsonify({"ok": True})
+
 @app.route("/")
 def index():
     return jsonify({"ok": True, "service": "Banco Liviano API conectada a Supabase"})
@@ -164,30 +173,49 @@ def movimientos(cedula):
 
 # --------------------------------------------------------------
 # 💳 INICIAR PAGO PAYPHONE (PRODUCCIÓN)
+#   - Crea un movimiento PENDIENTE (no suma saldo aún)
+#   - Llama a PayPhone con autenticación BASIC
+#   - Devuelve URL de checkout
 # --------------------------------------------------------------
 @app.route("/iniciar_pago_payphone", methods=["POST"])
 def iniciar_pago_payphone():
     data = request.get_json()
     cedula = data.get("nombre")
-    monto = float(data.get("monto", 0))
+    try:
+        monto = float(data.get("monto", 0))
+    except Exception:
+        monto = 0
+
+    if monto <= 0:
+        return jsonify({"error": "Monto inválido"}), 400
 
     usuario = Usuario.query.filter_by(cedula=cedula).first()
     if not usuario:
         return jsonify({"error": "Usuario no encontrado"}), 404
 
-    # Normalizar teléfono
+    # Normalizar teléfono (ej. 099... -> 99... con country 593)
     phone = ''.join(ch for ch in usuario.telefono if ch.isdigit())
     if phone.startswith("0"):
         phone = phone[1:]
 
-    monto_centavos = int(monto * 100)
-    tx_id = f"TX-{uuid.uuid4().hex[:10]}"
+    monto_centavos = int(round(monto * 100))
+    reference = f"TX-{uuid.uuid4().hex[:10]}"
+
+    # 1) Registrar movimiento PENDIENTE (no sumamos al saldo aún)
+    mov = Movimiento(
+        usuario_id=usuario.id,
+        titulo=f"[PENDIENTE] Recarga {reference}",
+        tipo="ingreso",
+        monto=monto
+    )
+    db.session.add(mov)
+    db.session.commit()
 
     payload = {
         "phoneNumber": phone,
         "countryCode": "593",
         "clientUserId": usuario.cedula,
-        "reference": tx_id,
+        "reference": reference,
         "amount": monto_centavos,
         "amountWithTax": monto_centavos,
         "amountWithoutTax": 0,
@@ -197,8 +225,10 @@ def iniciar_pago_payphone():
         "callbackURL": PAYPHONE_URL_CALLBACK,
     }
 
+    # Autenticación BASIC: base64("CLIENT_ID:SECRET")
+    basic_token = base64.b64encode(f"{PAYPHONE_CLIENT_ID}:{PAYPHONE_SECRET}".encode()).decode()
     headers = {
-        "Authorization": f"Bearer {PAYPHONE_TOKEN}",
+        "Authorization": f"Basic {basic_token}",
         "Content-Type": "application/json",
     }
 
@@ -207,13 +237,14 @@ def iniciar_pago_payphone():
         print("📤 Enviado a PayPhone:", r.status_code, r.text)
         if r.status_code == 200:
             response = r.json()
+            # Respuesta correcta trae 'payWithPayPhoneUrl'
             if "payWithPayPhoneUrl" in response:
                 return jsonify({
                     "ok": True,
                     "payphone_url": response["payWithPayPhoneUrl"]
                 })
-            else:
-                return jsonify({"error": "Respuesta inesperada de PayPhone", "detalle": response}), 500
+            # Si no trae la URL, devolvemos detalle
+            return jsonify({"error": "Respuesta inesperada de PayPhone", "detalle": response}), 500
         else:
             return jsonify({"error": "Error en PayPhone", "detalle": r.text}), 500
     except Exception as e:
@@ -221,28 +252,43 @@ def iniciar_pago_payphone():
 
 
 # --------------------------------------------------------------
-# 🔁 CALLBACK PAYPHONE
+# 🔁 CALLBACK PAYPHONE (marca movimiento COMPLETADO y acredita saldo)
 # --------------------------------------------------------------
 @app.route("/payphone_callback", methods=["GET", "POST"])
 def payphone_callback():
-    # Cuando PayPhone finaliza el pago, llega aquí
     data = request.values.to_dict()
     print("📥 Callback recibido:", data)
 
     reference = data.get("reference")
+    transaction_status = data.get("transactionStatus") or data.get("status")  # por si cambia el nombre
+
     if not reference:
         return "Sin referencia", 400
 
-    movimiento = Movimiento.query.filter(Movimiento.titulo.contains(reference)).first()
-    if not movimiento:
+    mov = Movimiento.query.filter(Movimiento.titulo.contains(reference)).first()
+    if not mov:
         return "Transacción no encontrada", 404
 
-    # Marcar como completado
-    usuario = movimiento.usuario
-    usuario.saldo += movimiento.monto
-    db.session.commit()
+    # Solo si estaba pendiente y el status es aprobado
+    titulo_original = mov.titulo or ""
+    aprobado = str(transaction_status).lower() in ("approved", "aprobada", "success", "ok", "true", "1", "aprobado")
 
-    return "<h3>✅ Recarga completada correctamente. Puedes cerrar esta ventana.</h3>"
+    if titulo_original.startswith("[PENDIENTE]"):
+        if aprobado:
+            # Acreditar saldo y marcar movimiento
+            usuario = mov.usuario
+            usuario.saldo = (usuario.saldo or 0) + mov.monto
+            mov.titulo = titulo_original.replace("[PENDIENTE] ", "").strip()
+            db.session.commit()
+            return "<h3>✅ Recarga completada correctamente. Puedes cerrar esta ventana.</h3>"
+        else:
+            # Marcar como fallida (opcional: podrías borrar o renombrar)
+            mov.titulo = titulo_original.replace("[PENDIENTE]", "[FALLIDA]").strip()
+            db.session.commit()
+            return "<h3>❌ Pago rechazado o cancelado.</h3>"
+
+    # Si ya no estaba pendiente, simplemente confirmamos
+    return "<h3>ℹ️ Recarga ya procesada.</h3>"
 
 
 # --------------------------------------------------------------
