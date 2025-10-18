@@ -14,18 +14,22 @@ CORS(app)
 # ⚙️ CONFIGURACIÓN DE LA BASE DE DATOS (SUPABASE)
 # =================================================================
 
-# 🔹 Usa la variable de entorno configurada en Render
+# ✅ 1️⃣ Cargar URL desde las variables de entorno
 db_url = os.getenv("SUPABASE_DB_URL", "sqlite:///banco_liviano.db")
 
-# 🔹 Corrige formato si viene en modo viejo
+# ✅ 2️⃣ Corregir formato si viene como postgres://
 if db_url.startswith("postgres://"):
     db_url = db_url.replace("postgres://", "postgresql://", 1)
 
-# 🔹 Muestra en logs qué base se está usando (para verificar)
+# ✅ 3️⃣ Agregar sslmode=require (obligatorio)
+if "?sslmode=require" not in db_url:
+    db_url += "?sslmode=require"
+
+# ✅ 4️⃣ Mostrar la URL (para verificar en logs)
 print("🧩 Conectando a base de datos:", db_url)
 
-# 🔹 Fuerza SSL obligatorio (requerido por Supabase)
-app.config["SQLALCHEMY_DATABASE_URI"] = db_url + "?sslmode=require"
+# ✅ 5️⃣ Aplicar configuración a SQLAlchemy
+app.config["SQLALCHEMY_DATABASE_URI"] = db_url
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
 db = SQLAlchemy(app)
