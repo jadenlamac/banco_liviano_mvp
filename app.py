@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, redirect, url_for
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -6,7 +6,7 @@ from datetime import datetime
 import os
 import uuid
 from sqlalchemy import Numeric
-import requests # ⬅️ IMPORTADO: Para comunicarnos con PayPhone
+import requests # ⬅️ IMPORTADO: Necesario para PayPhone
 
 app = Flask(__name__)
 CORS(app)
@@ -21,6 +21,11 @@ db_url = os.getenv("SUPABASE_DB_URL", "sqlite:///banco_liviano.db")
 if db_url.startswith("postgres://"):
     db_url = db_url.replace("postgres://", "postgresql://", 1)
 
+# ✅ Asegura que use SSL (requerido por Supabase)
+# NOTA: Si usas el Pooler de Supabase (puerto 6543) DEBES ELIMINAR O COMENTAR la siguiente línea.
+if "?sslmode=require" not in db_url:
+    db_url += "?sslmode=require"
+
 # ✅ Log de conexión
 print("🧩 Conectando a base de datos:", db_url)
 
@@ -30,13 +35,14 @@ app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 db = SQLAlchemy(app)
 
 # =================================================================
-# 🔑 CONFIGURACIÓN DE PAYPHONE (LISTO)
+# 🔑 CONFIGURACIÓN DE PAYPHONE (USANDO TUS CREDENCIALES)
 # =================================================================
-# Credenciales de la imagen (ajusta si usas variables de entorno)
+# Credenciales obtenidas de tu captura anterior
 PAYPHONE_TOKEN = os.getenv("PAYPHONE_TOKEN", "J8GXWQ6hPUdK0jSb938Q")
-PAYPHONE_SECRET = os.getenv("PAYPHONE_SECRET", "cHDAJ4oikm6ZqSZXs5OYxA")
-PAYPHONE_STORE_ID = os.getenv("PAYPHONE_STORE_ID", 12555) # ⬅️ STORE ID USADO
+PAYPHONE_SECRET = os.getenv("PAYPHONE_SECRET", "cHDAJ4oikm6ZqSZXs5OYxA") 
+PAYPHONE_STORE_ID = os.getenv("PAYPHONE_STORE_ID", 12555) 
 PAYPHONE_URL_PAGO = "https://pay.payphonetodo.com/api/v1/Deuda" 
+PAYPHONE_URL_CALLBACK = "https://banco-liviano-mvp.onrender.com/payphone_callback"
 # =================================================================
 
 # =================================================================
@@ -56,7 +62,8 @@ class Usuario(db.Model):
 
 class Movimiento(db.Model):
     __tablename__ = 'transacciones'
-    id = db.Column(db.Integer, primary_key=True)
+    # ⚠️ CAMBIADO: Debe ser String (UUID) para usarlo como referencia de PayPhone
+    id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4())) 
     usuario_id = db.Column(db.Integer, db.ForeignKey("usuarios.id"), nullable=False)
     titulo = db.Column(db.String(100), nullable=False)
     tipo = db.Column(db.String(20))
@@ -69,7 +76,7 @@ class Movimiento(db.Model):
 
 @app.route("/")
 def index():
-    return jsonify({"ok": True, "service": "Banco Liviano API conectada a Supabase"})
+    return jsonify({"ok": True, "service": "Banco Liviano API"})
 
 # -------------------- CREAR USUARIO --------------------
 @app.route("/crear_usuario", methods=["POST"])
@@ -145,7 +152,7 @@ def movimientos(cedula):
     if not usuario:
         return jsonify({"error": "Usuario no encontrado"}), 404
 
-    movs = Movimiento.query.filter_by(usuario_id=usuario.id).order_by(Movimiento.fecha.desc()).all()
+    movs = Movimiento.query.filter(Movimiento.usuario_id == usuario.id).order_by(Movimiento.fecha.desc()).all()
     lista = [
         {
             "titulo": m.titulo,
@@ -157,7 +164,7 @@ def movimientos(cedula):
     ]
     return jsonify({"ok": True, "movimientos": lista})
 
-# -------------------- PAGAR (P2P) --------------------
+# -------------------- PAGAR (Transferencia P2P) --------------------
 @app.route("/pagar", methods=["POST"])
 def pagar():
     data = request.get_json()
@@ -190,110 +197,135 @@ def pagar():
 
 
 # =================================================================
-# 💸 RUTAS DE PAGOS (PAYPHONE) - RECARGA
+# 🚀 RUTAS DE PAYPHONE (IMPLEMENTACIÓN COMPLETA)
 # =================================================================
 
-# -------------------- 1. INICIAR PAGO (Llamada desde Flutter) --------------------
+# -------------------- 1. INICIAR PAGO --------------------
 @app.route("/iniciar_pago_payphone", methods=["POST"])
 def iniciar_pago_payphone():
     data = request.get_json()
     cedula = data.get("nombre")
-    monto_usd = data.get("monto", 0)
-    
-    try:
-        monto_centavos = int(float(monto_usd) * 100)
-    except ValueError:
-        return jsonify({"error": "Monto inválido"}), 400
-
-    if not cedula or monto_centavos <= 0:
-        return jsonify({"error": "Faltan cédula o monto"}), 400
+    monto = data.get("monto")
 
     usuario = Usuario.query.filter_by(cedula=cedula).first()
     if not usuario:
-        return jsonify({"error": "Usuario de Banco Liviano no existe"}), 404
+        return jsonify({"ok": False, "error": "Usuario no encontrado"}), 404
 
-    callback_url = f"{request.url_root}payphone_callback?cedula={cedula}"
-
-    headers = {
-        'Authorization': f'Bearer {PAYPHONE_TOKEN}', 
-        'Content-Type': 'application/json',
-    }
-
-    payload = {
-        "amount": monto_centavos,
-        "amountWithTax": monto_centavos, 
-        "clientTransactionId": str(uuid.uuid4()),
-        "responseUrl": callback_url, 
-        "cancellationUrl": callback_url,
-        "storeId": int(PAYPHONE_STORE_ID),
-    }
+    if not monto or float(monto) <= 0:
+        return jsonify({"ok": False, "error": "Monto inválido"}), 400
 
     try:
-        response = requests.post(PAYPHONE_URL_PAGO, headers=headers, json=payload)
-        response.raise_for_status()
+        monto_centavos = int(float(monto) * 100)
+        tx_id = str(uuid.uuid4())
 
-        payphone_data = response.json()
-        payment_url = payphone_data.get("payment_url") 
+        # Crear un movimiento temporal (Pendiente) antes de llamar a PayPhone
+        movimiento = Movimiento(
+            id=tx_id, 
+            usuario_id=usuario.id, 
+            titulo="Recarga - Pendiente PayPhone", 
+            tipo="ingreso", 
+            monto=float(monto)
+        )
+        db.session.add(movimiento)
+        db.session.commit()
 
-        if payment_url:
+        headers = {
+            "Authorization": f"Bearer {PAYPHONE_TOKEN}",
+            "Content-Type": "application/json",
+        }
+
+        payload = {
+            "phoneNumber": usuario.telefono,
+            "countryCode": "593",
+            "clientUserId": usuario.cedula,
+            "reference": tx_id,
+            "amount": monto_centavos,
+            "amountWithTax": monto_centavos,
+            "amountWithoutTax": 0,
+            "tax": 0,
+            "storeId": PAYPHONE_STORE_ID,
+            "currency": "USD",
+            "callbackURL": PAYPHONE_URL_CALLBACK,
+        }
+
+        res = requests.post(PAYPHONE_URL_PAGO, json=payload, headers=headers)
+        res.raise_for_status() 
+        
+        payphone_data = res.json()
+        
+        if payphone_data.get('payphoneUrl'):
             return jsonify({
                 "ok": True,
-                "payphone_url": payment_url 
+                "mensaje": "Pago iniciado, redirigiendo a PayPhone",
+                "payphone_url": payphone_data['payphoneUrl']
             })
         else:
-            return jsonify({"error": payphone_data.get("message", "Error desconocido de PayPhone")}), 500
+            return jsonify({"ok": False, "error": "Error de PayPhone: URL no recibida", "detail": payphone_data}), 500
 
-    except requests.exceptions.RequestException as e:
-        print(f"Error de PayPhone: {e}")
-        return jsonify({"error": "Error al comunicar con PayPhone"}), 500
+    except requests.exceptions.HTTPError as e:
+        Movimiento.query.filter_by(id=tx_id).delete()
+        db.session.commit()
+        return jsonify({"ok": False, "error": f"Error HTTP de PayPhone: {e.response.status_code}", "detail": str(e.response.text)}), 500
+    except Exception as e:
+        Movimiento.query.filter_by(id=tx_id).delete()
+        db.session.commit()
+        return jsonify({"ok": False, "error": f"Error interno: {str(e)}"}), 500
 
-# -------------------- 2. CALLBACK DE CONFIRMACIÓN (Llamada desde PayPhone) --------------------
+# -------------------- 2. CALLBACK DE PAYPHONE --------------------
 @app.route("/payphone_callback", methods=["GET", "POST"])
 def payphone_callback():
-    transaction_id = request.args.get("transactionId") or request.form.get("transactionId")
-    cedula = request.args.get("cedula") 
-    
-    if not transaction_id or not cedula:
-        return "Error en Callback: Faltan datos", 400
+    transaction_id = request.args.get('transactionId') or request.form.get('transactionId')
 
-    # VERIFICAR EL ESTADO REAL de la transacción
+    if not transaction_id:
+        return "ID de transacción no recibido", 400
+
     headers = {
-        'Authorization': f'Bearer {PAYPHONE_TOKEN}',
-        'Content-Type': 'application/json',
+        "Authorization": f"Bearer {PAYPHONE_TOKEN}",
+        "Content-Type": "application/json",
     }
     
-    verification_url = f"https://pay.payphonetodo.com/api/v1/transaction/status/{transaction_id}" 
-
+    url_consulta = f"https://pay.payphonetodo.com/api/v1/Deuda/Transaccion/{transaction_id}"
+    
     try:
-        status_response = requests.get(verification_url, headers=headers)
-        status_data = status_response.json()
+        res = requests.get(url_consulta, headers=headers)
+        res.raise_for_status()
+        tx_data = res.json()
+    except Exception:
+        return "Error al consultar estado de pago.", 500
+
+    tx_status = tx_data.get('transactionStatus') 
+    tx_reference = tx_data.get('clientTransactionId')
+
+    if tx_status == 1:
+        # Pago APROBADO: Actualizar saldo y movimiento
+        movimiento = Movimiento.query.filter_by(id=tx_reference).first()
         
-        # El código '3' significa Aprobado (Confirmar con la documentación de PayPhone)
-        if status_data.get("statusCode") == 3: 
+        if movimiento and movimiento.titulo == "Recarga - Pendiente PayPhone":
+            usuario = Usuario.query.get(movimiento.usuario_id)
+            monto_usd = float(movimiento.monto)
+
+            usuario.saldo += monto_usd
+            movimiento.titulo = f"Recarga PayPhone ID: {transaction_id}"
             
-            usuario = Usuario.query.filter_by(cedula=cedula).first()
-            monto = float(status_data.get("amount", 0)) / 100.0
+            db.session.commit()
             
-            if usuario:
-                usuario.saldo += monto
-                movimiento = Movimiento(
-                    usuario_id=usuario.id, 
-                    titulo=f"Recarga PayPhone ID: {transaction_id}", 
-                    tipo="ingreso", 
-                    monto=monto
-                )
-                db.session.add(movimiento)
-                db.session.commit()
-                
-                return "Recarga exitosa. Volviendo a la App...", 200 
-            else:
-                return "Error: Usuario no encontrado en Banco Liviano", 404
-        else:
-            return "Pago no aprobado/cancelado. Volviendo a la App...", 200
-            
-    except Exception as e:
-        print(f"Error en verificación de callback: {e}")
-        return "Error interno en la verificación final.", 500
+            return "<html><body><h1>✅ Recarga exitosa</h1><p>Tu saldo ha sido actualizado. Regresa a la app.</p></body></html>", 200
+        
+        return "Error: Transacción ya procesada o movimiento no encontrado.", 400
+
+
+    elif tx_status == 3:
+        # Pago RECHAZADO: Eliminar movimiento pendiente
+        movimiento = Movimiento.query.filter_by(id=tx_reference).first()
+        if movimiento:
+            db.session.delete(movimiento)
+            db.session.commit()
+        
+        return "<html><body><h1>❌ Pago rechazado</h1><p>Intenta recargar nuevamente.</p></body></html>", 200
+
+    else:
+        # Otro estado (Pendiente)
+        return "<html><body><h1>⏳ Pago Pendiente</h1><p>Vuelve a la app para verificar tu saldo.</p></body></html>", 200
 
 
 # =================================================================
@@ -301,6 +333,8 @@ def payphone_callback():
 # =================================================================
 
 with app.app_context():
+    # ⚠️ IMPORTANTE: Si ya creaste tablas con id=Integer, deberás eliminarlas o renombrarlas 
+    # en Supabase para que SQLAlchemy pueda crear el nuevo esquema con id=String(36)
     db.create_all()
 
 if __name__ == "__main__":
